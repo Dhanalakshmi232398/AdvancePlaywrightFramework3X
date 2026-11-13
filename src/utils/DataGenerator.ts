@@ -1,5 +1,5 @@
 /**
- * DataGenerator — Faker-backed fake data for the TTACart project.
+ * DataGenerator — Faker-backed and LLM-generated fake data for TTACart.
  *
  * TTACart is a SauceDemo-style storefront: it needs login credentials and
  * checkout customer info (first name, last name, postal code). This util
@@ -14,6 +14,23 @@
 
 import { faker } from '@faker-js/faker';
 import { envOr } from '@config/env';
+import { hasApiKey, normalizeProvider, PROVIDERS } from '../ai/config/providers';
+import { CHECKOUT_CUSTOMER_PROMPT } from '../ai/prompts/checkoutCustomer';
+import { TRANSFER_NOTE_PROMPT } from '../ai/prompts/transferNote';
+import { generateJson } from '../ai/llmGateway';
+
+function shouldFallbackToFaker(): boolean {
+    const selectedProvider = process.env.LLM_PROVIDER?.trim();
+    const configuredKeyCount = Object.values(PROVIDERS).filter(
+        ({ apiKeyEnv }) => (process.env[apiKeyEnv] ?? '').trim().length > 0,
+    ).length;
+
+    if (!selectedProvider) return configuredKeyCount === 0;
+
+    const provider = normalizeProvider(selectedProvider);
+    return provider !== undefined
+        && !(process.env[PROVIDERS[provider].apiKeyEnv] ?? '').trim();
+}
 
 export interface Credentials {
     username: string;
@@ -78,6 +95,45 @@ export class DataGenerator {
         return faker.location.zipCode();
     }
 
+    static transferNote(): string {
+        const words = faker.lorem.words(8).split(' ');
+        const note: string[] = [];
+
+        for (const word of words) {
+            const candidate = [...note, word].join(' ');
+            if (candidate.length > 60) break;
+            note.push(word);
+        }
+
+        return note.join(' ');
+    }
+
+    /** Generates a short transfer note through the configured LLM provider. */
+    static async transferNoteFromAI(): Promise<string> {
+        if (!hasApiKey() && shouldFallbackToFaker()) {
+            console.warn(
+                '[DataGenerator] No API key for the selected LLM provider; skipping AI and using a Faker transfer note.',
+            );
+            return DataGenerator.transferNote();
+        }
+
+        const response = await generateJson<unknown>(TRANSFER_NOTE_PROMPT);
+        if (!response || typeof response !== 'object' || Array.isArray(response) || !('note' in response)) {
+            throw new Error('LLM returned invalid transfer note data.');
+        }
+
+        const value = response.note;
+        if (typeof value !== 'string') {
+            throw new Error('LLM returned invalid transfer note data: note must be a string.');
+        }
+
+        const note = value.trim().replace(/\s+/g, ' ');
+        if (note.length === 0 || note.length > 60) {
+            throw new Error('LLM returned invalid transfer note data: note must be 1-60 characters.');
+        }
+        return note;
+    }
+
     // ---------- primitives ----------
 
     /** Whole number in an inclusive range, e.g. a price or a quantity. */
@@ -117,6 +173,74 @@ export class DataGenerator {
             firstName: DataGenerator.firstName(),
             lastName: DataGenerator.lastName(),
             postalCode: DataGenerator.postalCode(),
+        };
+    }
+
+    /** Generates fictional checkout data through the configured LLM provider. */
+    static async checkoutCustomerFromAI(): Promise<CheckoutCustomer> {
+        if (!hasApiKey() && shouldFallbackToFaker()) {
+            console.warn(
+                '[DataGenerator] No API key for the selected LLM provider; skipping AI and using Faker checkout data.',
+            );
+            return DataGenerator.checkoutCustomer();
+        }
+
+        const response = await generateJson<unknown>(CHECKOUT_CUSTOMER_PROMPT);
+        if (!response || typeof response !== 'object' || Array.isArray(response)) {
+            throw new Error('LLM returned invalid checkout customer data.');
+        }
+
+        const fieldAliases: Record<string, string[]> = {
+            firstName: ['firstname'],
+            lastName: ['lastname'],
+            postalCode: ['postalcode', 'zipcode', 'zip'],
+        };
+        const normalizeKey = (key: string) => key.replace(/[^a-z]/gi, '').toLowerCase();
+        const findCustomer = (value: unknown): Record<string, unknown> | undefined => {
+            if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+            const record = value as Record<string, unknown>;
+            const keys = Object.keys(record).map(normalizeKey);
+            if (Object.values(fieldAliases).every((aliases) => keys.some((key) => aliases.includes(key)))) {
+                return record;
+            }
+
+            for (const nested of Object.values(record)) {
+                const customer = findCustomer(nested);
+                if (customer) return customer;
+            }
+            return undefined;
+        };
+        const customer = findCustomer(response);
+        if (!customer) {
+            throw new Error('LLM response is missing firstName, lastName, or postalCode.');
+        }
+        const readField = (field: string): unknown => {
+            const aliases = fieldAliases[field];
+            const key = Object.keys(customer).find((name) => aliases.includes(normalizeKey(name)));
+            return key ? customer[key] : undefined;
+        };
+        const normalizeName = (field: string): string => {
+            const value = readField(field);
+            if (typeof value !== 'string') {
+                throw new Error(`LLM returned invalid checkout customer data: ${field} must be a string.`);
+            }
+
+            const name = value.trim().replace(/\s+/g, ' ');
+            if (name.length > 50 || !/^\p{L}[\p{L}\p{M}]*(?:[ '\u2019-]\p{L}[\p{L}\p{M}]*)*$/u.test(name)) {
+                throw new Error(`LLM returned invalid checkout customer data: ${field} must be a valid name.`);
+            }
+            return name;
+        };
+
+        const postalCode = readField('postalCode');
+        if (typeof postalCode !== 'string' || !/^\d{5}$/.test(postalCode.trim())) {
+            throw new Error('LLM returned invalid checkout customer data: postalCode must be 5 digits.');
+        }
+
+        return {
+            firstName: normalizeName('firstName'),
+            lastName: normalizeName('lastName'),
+            postalCode: postalCode.trim(),
         };
     }
 
