@@ -31,6 +31,8 @@ import { CartPage } from '@pages/CartPage';
 import { CheckoutStepOnePage } from '@pages/CheckoutStepOnePage';
 import { CheckoutStepTwoPage } from '@pages/CheckoutStepTwoPage';
 import { CheckoutCompletePage } from '@pages/CheckoutCompletePage';
+import { analyzeLocatorFailure } from '../ai/agents/selfHealAgent';
+import type { HealReport } from '../utils/selfHeal';
 
 import loginTestData from '@testdata/logintestdata.json';
 
@@ -77,9 +79,105 @@ export type TestFixture = {
     validLogin: LoginPage;
     loginWithInventory: InventoryPage;
     loginWithSelectedItem: SelectedItemState;
+    locatorFailureSelfHeal: void;
 };
 
 export const test = base.extend<TestFixture>({
+
+    locatorFailureSelfHeal: [async ({ page }, use, testInfo) => {
+        await use();
+
+        const failure = testInfo.errors
+            .map((error) => [error.message, error.stack].filter(Boolean).join('\n'))
+            .join('\n')
+            .slice(0, 4_000);
+        if (!failure || !/(locator|strict mode violation|waiting for locator|resolved to \d+ elements)/i.test(failure)) {
+            return;
+        }
+
+        const selectorMatch = failure.match(/locator\((['"`])([\s\S]*?)\1\)/i);
+        const failedSelector = selectorMatch?.[2] ?? 'Selector could not be extracted from the Playwright error.';
+        let pageSnapshot = '';
+        const report: HealReport = {
+            failedSelector,
+            intent: `Repair the locator used by "${testInfo.title}".`,
+            verified: [],
+            rejected: [],
+            suggestions: [],
+        };
+
+        try {
+            pageSnapshot = await page.evaluate(() => {
+                const redact = (value: string) => value
+                    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[redacted-email]')
+                    .replace(/\b(?:\+?\d[\d\s().-]{7,}\d)\b/g, '[redacted-phone]');
+                const elements = Array.from(document.querySelectorAll('body *'))
+                    .filter((element) => {
+                        const tag = element.tagName.toLowerCase();
+                        return ['button', 'a', 'input', 'textarea', 'select', 'label'].includes(tag)
+                            || element.hasAttribute('role')
+                            || element.hasAttribute('data-test')
+                            || element.hasAttribute('data-testid');
+                    })
+                    .slice(0, 160)
+                    .map((element) => {
+                        const tag = element.tagName.toLowerCase();
+                        const attributes = ['role', 'aria-label', 'data-test', 'data-testid', 'type', 'placeholder']
+                            .map((name) => [name, element.getAttribute(name)])
+                            .filter((entry): entry is [string, string] => entry[1] !== null)
+                            .map(([name, value]) => `${name}="${redact(value).slice(0, 120)}"`);
+                        const text = ['button', 'a', 'label'].includes(tag)
+                            ? redact((element.textContent ?? '').replace(/\s+/g, ' ').trim()).slice(0, 120)
+                            : '';
+                        return `<${tag}${attributes.length ? ` ${attributes.join(' ')}` : ''}>${text}</${tag}>`;
+                    });
+                return JSON.stringify({
+                    path: window.location.pathname,
+                    title: document.title.slice(0, 120),
+                    elements,
+                }).slice(0, 12_000);
+            });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            report.unavailableReason = `Could not capture the page snapshot: ${message}`;
+        }
+
+        try {
+            const screenshot = await page.screenshot({ fullPage: true });
+            await testInfo.attach('Self-Heal page', {
+                body: screenshot,
+                contentType: 'image/png',
+            });
+            report.screenshotAttachment = 'Self-Heal page';
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.warn(`[Self-Heal] Could not capture page screenshot for "${testInfo.title}": ${message}`);
+        }
+
+        if (pageSnapshot) {
+            try {
+                Object.assign(report, await analyzeLocatorFailure({
+                    testTitle: testInfo.title,
+                    file: testInfo.file,
+                    failedSelector,
+                    failure,
+                    pageSnapshot,
+                    intent: report.intent,
+                }));
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                report.unavailableReason = `Self-Heal agent failed: ${message}`;
+                console.error(`[Self-Heal] Agent failed for "${testInfo.title}": ${message}`);
+            }
+        } else if (!report.unavailableReason) {
+            report.unavailableReason = 'No page snapshot was available for locator analysis.';
+        }
+
+        await testInfo.attach('self-heal', {
+            body: JSON.stringify(report),
+            contentType: 'application/json',
+        });
+    }, { auto: true }],
 
     loginPage: async ({ page }, use) => {
         await use(new LoginPage(page));

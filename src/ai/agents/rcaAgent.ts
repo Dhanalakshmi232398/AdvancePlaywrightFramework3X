@@ -1,9 +1,11 @@
 /**
  * Root Cause Analysis agent.
- *
- * Stub implementation: returns a heuristic verdict derived from the error text.
- * Swap the body of analyzeFailure() for a real LLM call when a key is wired up.
  */
+
+import type { JSONSchemaType } from 'ajv';
+import { createAgent } from './agentFactory';
+import { PROVIDERS } from '../config/providers';
+import { rootCausePrompt } from '../prompts/rootCause';
 
 export interface RcaVerdict {
     rootCause: string;
@@ -19,7 +21,30 @@ export interface FailureInput {
     stack?: string;
 }
 
-export async function analyzeFailure(input: FailureInput): Promise<RcaVerdict> {
+export interface FailureAnalysis {
+    source: 'llm' | 'heuristic';
+    verdict: RcaVerdict;
+}
+
+const rcaSchema: JSONSchemaType<RcaVerdict> = {
+    type: 'object',
+    properties: {
+        rootCause: { type: 'string', minLength: 1 },
+        severity: { type: 'string', enum: ['low', 'medium', 'high'] },
+        priority: { type: 'string', enum: ['P0', 'P1', 'P2', 'P3'] },
+        fixes: { type: 'array', items: { type: 'string', minLength: 1 } },
+    },
+    required: ['rootCause', 'severity', 'priority', 'fixes'],
+    additionalProperties: false,
+};
+
+const rcaAgent = createAgent<FailureInput, RcaVerdict>({
+    name: 'RCA agent',
+    prompt: rootCausePrompt,
+    schema: rcaSchema,
+});
+
+function heuristicVerdict(input: FailureInput): RcaVerdict {
     const err = input.error.toLowerCase();
 
     if (err.includes('strict mode violation')) {
@@ -44,4 +69,18 @@ export async function analyzeFailure(input: FailureInput): Promise<RcaVerdict> {
         priority: 'P2',
         fixes: ['Open the trace to inspect the failing action'],
     };
+}
+
+function hasConfiguredProvider(): boolean {
+    return Object.values(PROVIDERS).some(
+        ({ apiKeyEnv }) => (process.env[apiKeyEnv] ?? '').trim().length > 0,
+    );
+}
+
+export async function analyzeFailure(input: FailureInput): Promise<FailureAnalysis> {
+    if (!process.env.LLM_PROVIDER?.trim() && !hasConfiguredProvider()) {
+        return { source: 'heuristic', verdict: heuristicVerdict(input) };
+    }
+
+    return { source: 'llm', verdict: await rcaAgent.run(input) };
 }

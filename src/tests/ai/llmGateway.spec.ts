@@ -2,8 +2,23 @@ import { test, expect } from '@playwright/test';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import type { JSONSchemaType } from 'ajv';
 import { DataGenerator } from '@utils/DataGenerator';
+import { analyzeFailure } from '../../ai/agents/rcaAgent';
+import { analyzeLocatorFailure } from '../../ai/agents/selfHealAgent';
+import { createAgent } from '../../ai/agents/agentFactory';
 import { generateJson, generateJsonFile } from '../../ai/llmGateway';
+
+interface AgentAnswer {
+    answer: number;
+}
+
+const agentAnswerSchema: JSONSchemaType<AgentAnswer> = {
+    type: 'object',
+    properties: { answer: { type: 'integer' } },
+    required: ['answer'],
+    additionalProperties: false,
+};
 
 const providerKeys = [
     'OPENROUTER_API_KEY',
@@ -64,6 +79,121 @@ test.describe('LLM gateway', () => {
 
         await expect(generateJson<{ answer: number }>('Return an answer', { model: 'test-model' }))
             .resolves.toEqual({ answer: 42 });
+    });
+
+    test('creates an agent from a prompt and validates its output schema', async () => {
+        process.env.LLM_PROVIDER = 'openai';
+        process.env.OPENAI_API_KEY = 'test-openai-key';
+        globalThis.fetch = async () => new Response(JSON.stringify({
+            choices: [{ message: { content: '{"answer":42}' } }],
+        }), { status: 200 });
+
+        const answerAgent = createAgent<{ question: string }, AgentAnswer>({
+            name: 'answer agent',
+            prompt: ({ question }) => `Answer this question: ${question}`,
+            schema: agentAnswerSchema,
+        });
+
+        await expect(answerAgent.run({ question: 'What is 6 times 7?' }))
+            .resolves.toEqual({ answer: 42 });
+    });
+
+    test('reports agent output that does not match its schema', async () => {
+        process.env.LLM_PROVIDER = 'openai';
+        process.env.OPENAI_API_KEY = 'test-openai-key';
+        globalThis.fetch = async () => new Response(JSON.stringify({
+            choices: [{ message: { content: '{"answer":"forty-two"}' } }],
+        }), { status: 200 });
+
+        const answerAgent = createAgent<{ question: string }, AgentAnswer>({
+            name: 'answer agent',
+            prompt: ({ question }) => `Answer this question: ${question}`,
+            schema: agentAnswerSchema,
+        });
+
+        await expect(answerAgent.run({ question: 'What is 6 times 7?' }))
+            .rejects.toThrow('[answer agent] output did not match its schema');
+    });
+
+    test('runs the RCA agent through the configured provider and validates its verdict', async () => {
+        process.env.LLM_PROVIDER = 'openai';
+        process.env.OPENAI_API_KEY = 'test-openai-key';
+        globalThis.fetch = async (_input, init) => {
+            const body = JSON.parse(String(init?.body)) as {
+                messages: { role: string; content: string }[];
+            };
+            const prompt = body.messages.find((message) => message.role === 'user')?.content;
+            expect(prompt).toContain('checkout.spec.ts');
+            expect(prompt).toContain('expected true, received false');
+            return new Response(JSON.stringify({
+                choices: [{
+                    message: {
+                        content: JSON.stringify({
+                            rootCause: 'The test assertion expected an incorrect result.',
+                            severity: 'medium',
+                            priority: 'P2',
+                            fixes: ['Update the expected assertion to match the intended behavior.'],
+                        }),
+                    },
+                }],
+            }), { status: 200 });
+        };
+
+        await expect(analyzeFailure({
+            title: 'checkout assertion',
+            file: 'checkout.spec.ts',
+            error: 'expected true, received false',
+        })).resolves.toEqual({
+            source: 'llm',
+            verdict: {
+                rootCause: 'The test assertion expected an incorrect result.',
+                severity: 'medium',
+                priority: 'P2',
+                fixes: ['Update the expected assertion to match the intended behavior.'],
+            },
+        });
+    });
+
+    test('suggests a locator from the captured page snapshot through the LLM gateway', async () => {
+        process.env.LLM_PROVIDER = 'openai';
+        process.env.OPENAI_API_KEY = 'test-openai-key';
+        globalThis.fetch = async (_input, init) => {
+            const body = JSON.parse(String(init?.body)) as {
+                messages: { role: string; content: string }[];
+            };
+            const prompt = body.messages.find((message) => message.role === 'user')?.content;
+            expect(prompt).toContain('data-test=&quot;firstName&quot;');
+            expect(prompt).toContain('brokenFirstName');
+            return new Response(JSON.stringify({
+                choices: [{
+                    message: {
+                        content: JSON.stringify({
+                            suggestions: [{
+                                selector: "page.getByRole('textbox', { name: 'First Name', exact: true })",
+                                strategy: 'role',
+                                reasoning: 'The captured checkout page exposes a First Name textbox.',
+                            }],
+                        }),
+                    },
+                }],
+            }), { status: 200 });
+        };
+
+        await expect(analyzeLocatorFailure({
+            testTitle: 'checkout locator recovery',
+            file: 'e2e-checkout-self-heal.spec.ts',
+            failedSelector: '[data-test="brokenFirstName"]',
+            failure: 'waiting for locator("[data-test=\\"brokenFirstName\\"]")',
+            pageSnapshot: '<input data-test=&quot;firstName&quot; aria-label=&quot;First Name&quot;>',
+            intent: 'Fill the checkout first name.',
+        })).resolves.toMatchObject({
+            failedSelector: '[data-test="brokenFirstName"]',
+            suggestions: [{
+                selector: "page.getByRole('textbox', { name: 'First Name', exact: true })",
+                strategy: 'role',
+            }],
+            verified: [],
+        });
     });
 
     test('supports direct Anthropic requests and the Claude alias', async () => {
@@ -129,10 +259,11 @@ test.describe('LLM gateway', () => {
         };
 
         try {
-            const customer = await DataGenerator.checkoutCustomerFromAI();
-            expect(customer.firstName).toBeTruthy();
-            expect(customer.lastName).toBeTruthy();
-            expect(customer.postalCode).toBeTruthy();
+            const generation = await DataGenerator.checkoutCustomerFromAIWithSource();
+            expect(generation.source).toBe('faker');
+            expect(generation.customer.firstName).toBeTruthy();
+            expect(generation.customer.lastName).toBeTruthy();
+            expect(generation.customer.postalCode).toBeTruthy();
             expect(warnings.join(' ')).toContain('skipping AI and using Faker');
         } finally {
             console.warn = originalWarn;

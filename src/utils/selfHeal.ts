@@ -1,9 +1,9 @@
 /**
  * Self-healing locator report.
  *
- * Shape only: the CustomReporter reads HealReport objects out of test
- * attachments. A healing fixture attaches one when it retries a failed
- * selector with candidates derived from the accessibility tree.
+ * The automatic test-base fixture attaches HealReport objects after a
+ * locator-related failure. The AI-proposed candidates are advisory and are
+ * not applied to the test.
  *
  * These field names are consumed directly by CustomReporter.generateSelfHealTab(),
  * so they must stay in sync with it.
@@ -30,6 +30,15 @@ export interface RejectedCandidate {
    reason: string;
 }
 
+export interface HealSuggestion {
+   /** Suggested Playwright locator expression; not applied automatically. */
+   selector: string;
+   /** How the locator is anchored: role, label, placeholder, testid, text, or css. */
+   strategy: 'role' | 'label' | 'placeholder' | 'testid' | 'text' | 'css';
+   /** Evidence from the captured page snapshot supporting this suggestion. */
+   reasoning: string;
+}
+
 export interface HealReport {
    /** The selector that failed to resolve. */
    failedSelector: string;
@@ -39,6 +48,12 @@ export interface HealReport {
    verified: HealCandidate[];
    /** Candidates considered and discarded. */
    rejected: RejectedCandidate[];
+   /** Model-proposed candidates; suggestions are never applied automatically. */
+   suggestions?: HealSuggestion[];
+   /** Attachment name used by the reporter to link the captured failure page. */
+   screenshotAttachment?: string;
+   /** Relative screenshot path assigned by the reporter. */
+   screenshot?: string;
    /** Set when healing could not run at all. */
    unavailableReason?: string;
 }

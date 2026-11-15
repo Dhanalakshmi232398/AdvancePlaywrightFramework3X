@@ -21,7 +21,7 @@ test.describe('@P0 @Regression E2E @Checkout Checkout Feature', () => {
         checkoutStepOnePage,
         checkoutStepTwoPage,
         checkoutCompletePage,
-    }) => {
+    }, testInfo) => {
         await visualStep(page, 'Inventory page: add first item to cart', async () => {
             await inventoryPage.assertLoaded();
             await inventoryPage.addToCart(FIRST_ITEM_ID);
@@ -35,7 +35,12 @@ test.describe('@P0 @Regression E2E @Checkout Checkout Feature', () => {
         await visualStep(page, 'Checkout step one: enter customer details', async () => {
             await cartPage.checkout();
             await checkoutStepOnePage.assertLoaded();
-            const customer = await DataGenerator.checkoutCustomerFromAI();
+            const generation = await DataGenerator.checkoutCustomerFromAIWithSource();
+            const customer = generation.customer;
+            await testInfo.attach('ai-data', {
+                body: JSON.stringify(generation),
+                contentType: 'application/json',
+            });
             await checkoutStepOnePage.fillGuest(customer);
             await expect(page.locator('[data-test="firstName"]')).toHaveValue(customer.firstName);
             await expect(page.locator('[data-test="lastName"]')).toHaveValue(customer.lastName);

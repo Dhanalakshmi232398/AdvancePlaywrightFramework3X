@@ -17,26 +17,15 @@ import {
 } from '@playwright/test/reporter';
 import * as fs from 'fs';
 import * as path from 'path';
+import { analyzeFailure, type RcaVerdict } from '../ai/agents/rcaAgent';
+import type { HealReport } from './selfHeal';
 
-interface RcaVerdict {
-    severity: string;
-    priority: string;
-    rootCause: string;
-    fixes: string[];
-}
-
-interface HealReport {
-    verified: {
-        selector: string;
-        strategy: string;
-        matchCount: number;
-        visible: boolean;
-        reasoning: string;
-    }[];
-    rejected: { selector: string; reason: string }[];
-    unavailableReason?: string;
-    failedSelector: string;
-    intent: string;
+interface AiVerdictEntry {
+    test: string;
+    file: string;
+    verdict?: RcaVerdict;
+    source?: 'llm' | 'heuristic';
+    error?: string;
 }
 
 interface FlakyResult {
@@ -118,9 +107,9 @@ class CustomTTAReporter implements Reporter {
     private runningTests: Map<string, TestData> = new Map();
     private completedTestIds: Set<string> = new Set();
     // AI-generated test data captured from `ai-data` attachments (for the AI Data tab).
-    private aiData: { test: string; json: string }[] = [];
+    private aiData: { test: string; json: string; source?: string }[] = [];
     // RCA verdicts produced by the RCA AI agent for failed tests (AI Verdict tab).
-    private aiVerdicts: { test: string; file: string; verdict: RcaVerdict }[] = [];
+    private aiVerdicts: AiVerdictEntry[] = [];
     // Verified locator repairs captured from `self-heal` attachments (Self-Heal tab).
     private healReports: { test: string; report: HealReport }[] = [];
     // Flaky analysis comparing this build with the previous one (Flaky tab).
@@ -242,7 +231,7 @@ class CustomTTAReporter implements Reporter {
         }
     }
 
-    onTestEnd(test: TestCase, result: TestResult): void {
+    async onTestEnd(test: TestCase, result: TestResult): Promise<void> {
         this.suiteStats.total++;
 
         let status: 'passed' | 'failed' | 'skipped' | 'timedOut';
@@ -334,15 +323,16 @@ class CustomTTAReporter implements Reporter {
                 }
             }
 
-            // AI-generated test data (from generateTestData -> testInfo.attach('ai-data')).
+            // Locator recovery suggestions and optional captured-page screenshot.
             if (attachment.name === 'self-heal' && attachment.contentType === 'application/json') {
                 try {
                     this.healReports.push({
                         test: test.title,
                         report: JSON.parse(attachment.body?.toString('utf-8') ?? '{}') as HealReport,
                     });
-                } catch {
-                    console.warn('Failed to read self-heal attachment');
+                } catch (error) {
+                    const message = error instanceof Error ? error.message : String(error);
+                    console.warn(`[CustomerReporter] Failed to read self-heal attachment for "${test.title}": ${message}`);
                 }
             }
             if (attachment.name === 'ai-data' && attachment.contentType === 'application/json') {
@@ -353,11 +343,24 @@ class CustomTTAReporter implements Reporter {
                             ? fs.readFileSync(attachment.path, 'utf-8')
                             : '';
                     if (body) {
-                        this.aiData.push({ test: test.title, json: body });
+                        const parsed: unknown = JSON.parse(body);
+                        const source = parsed
+                            && typeof parsed === 'object'
+                            && 'source' in parsed
+                            && (parsed.source === 'ai' || parsed.source === 'faker')
+                            ? parsed.source
+                            : undefined;
+                        this.aiData.push({ test: test.title, json: body, source });
                     }
                 } catch {
-                    console.warn('Failed to read ai-data attachment');
+                    console.warn(`Failed to read ai-data attachment for "${test.title}"`);
                 }
+            }
+        }
+
+        for (const entry of this.healReports) {
+            if (entry.test === test.title && entry.report.screenshotAttachment) {
+                entry.report.screenshot = stepScreenshots.get(entry.report.screenshotAttachment);
             }
         }
 
@@ -443,6 +446,30 @@ class CustomTTAReporter implements Reporter {
 
         this.runningTests.delete(test.id);
         this.completedTestIds.add(test.id);
+
+        if (status === 'failed' || status === 'timedOut') {
+            try {
+                const analysis = await analyzeFailure({
+                    title: test.title,
+                    file: test.location.file,
+                    error: result.error?.message ?? 'Test failed without an error message.',
+                    stack: result.error?.stack,
+                });
+                this.aiVerdicts.push({
+                    test: test.title,
+                    file: test.location.file,
+                    ...analysis,
+                });
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                console.error(`[CustomerReporter] RCA analysis failed for "${test.title}": ${message}`);
+                this.aiVerdicts.push({
+                    test: test.title,
+                    file: test.location.file,
+                    error: message,
+                });
+            }
+        }
 
         this.updateReportRealTime();
     }
@@ -917,17 +944,25 @@ class CustomTTAReporter implements Reporter {
             <button class="main-tab active" onclick="switchMainTab('results', this)">📋 Test Results</button>
             <button class="main-tab" onclick="switchMainTab('aidata', this)">🤖 AI Data${aiCount ? ` (${aiCount})` : ''}</button>
             <button class="main-tab" onclick="switchMainTab('verdict', this)">⚖️ AI Verdict${rcaCount ? ` (${rcaCount})` : ''}</button>
-            <button class="main-tab" onclick="switchMainTab('flaky', this)">🔁 Flaky${this.flakyResult ? ` (${this.flakyResult.counts.flaky})` : ''}</button>
+            <button class="main-tab" onclick="switchMainTab('flaky', this)">🔁 Flaky${this.flakyResult ? ` (${this.flakyResult.counts.flaky})` : ''}<!-- DEFLAKY_TAB_BADGE --></button>
             <button class="main-tab" onclick="switchMainTab('selfheal', this)">🩹 Self-Heal${this.healReports.length ? ` (${this.healReports.length})` : ''}</button>
         </div>`;
     }
 
-    // Self-Heal tab body: one card per dead locator, verified candidates first.
+    // Self-Heal tab body: AI suggestions remain advisory and are never applied.
     private generateSelfHealTab(): string {
         if (this.healReports.length === 0) {
             return `<div class="ai-empty">🩹 No locator failures in this run.</div>`;
         }
         return `<div class="ai-data-list">${this.healReports.map(({ test, report }) => {
+            const suggestions = report.suggestions?.length
+                ? report.suggestions.map((candidate) => `
+                    <div class="heal-row heal-suggestion">
+                        <code class="heal-sel">${this.escapeHtml(candidate.selector)}</code>
+                        <span class="heal-badge">${this.escapeHtml(candidate.strategy)}</span>
+                        <div class="heal-why">${this.escapeHtml(candidate.reasoning)}</div>
+                    </div>`).join('')
+                : `<div class="ai-empty">No locator suggestions were returned.</div>`;
             const verified = report.verified.length
                 ? report.verified.map((c) => `
                     <div class="heal-row heal-ok">
@@ -947,14 +982,19 @@ class CustomTTAReporter implements Reporter {
             const note = report.unavailableReason
                 ? `<div class="ai-empty">Agent unavailable: ${this.escapeHtml(report.unavailableReason)}</div>`
                 : '';
+            const screenshot = report.screenshot
+                ? `<a class="heal-screenshot" href="${this.escapeHtml(report.screenshot)}" target="_blank" rel="noopener">View captured page screenshot</a>`
+                : '';
             return `
             <div class="ai-card">
                 <div class="ai-card-title">🩹 ${this.escapeHtml(test)}</div>
                 <div class="heal-body">
                     <div class="heal-broken">Dead locator: <code>${this.escapeHtml(report.failedSelector)}</code>
                         <span class="heal-intent">(${this.escapeHtml(report.intent)})</span></div>
+                    ${screenshot}
                     ${note}
-                    <div class="heal-verified"><strong>Verified against the live page:</strong>${verified}</div>
+                    <div class="heal-verified"><strong>AI locator suggestions (not applied or verified):</strong>${suggestions}</div>
+                    ${report.verified.length ? `<div class="heal-verified"><strong>Verified against the live page:</strong>${verified}</div>` : ''}
                     ${rejected}
                     <div class="heal-note">Suggestions only. Nothing was rewritten.</div>
                 </div>
@@ -964,8 +1004,9 @@ class CustomTTAReporter implements Reporter {
 
     // Flaky tab body: build-vs-build counts, highlighted flaky tests, LLM summary.
     private generateFlakyTab(): string {
+        const deflakySection = '<div id="deflaky-report-section"><!-- DEFLAKY_REPORT_CONTENT --></div>';
         if (!this.flakyResult) {
-            return `<div class="ai-empty">🔁 Flaky analysis needs two builds. Run the suite again to compare.</div>`;
+            return `${deflakySection}<div class="ai-empty">🔁 No separate build-to-build comparison is available in this report.</div>`;
         }
         const r = this.flakyResult;
         const flakyList = r.flaky.length
@@ -976,6 +1017,7 @@ class CustomTTAReporter implements Reporter {
             : '';
         return `
         <div class="flaky-wrap">
+            ${deflakySection}
             <div class="flaky-compare">Comparing build <code>${this.escapeHtml(this.prevBuildId ?? '')}</code> → <code>${this.escapeHtml(this.currBuildId ?? '')}</code></div>
             <div class="flaky-counts">
                 <div class="flaky-count flaky"><div class="fc-num">${r.counts.flaky}</div><div class="fc-label">Flaky</div></div>
@@ -996,7 +1038,16 @@ class CustomTTAReporter implements Reporter {
     }
 
     // Render a single RCA verdict: severity, priority, root cause, fix bullets.
-    private renderVerdictCard(v: { test: string; file: string; verdict: RcaVerdict }): string {
+    private renderVerdictCard(v: AiVerdictEntry): string {
+        if (!v.verdict) {
+            return `
+            <div class="ai-card">
+                <div class="ai-card-title">⚖️ ${this.escapeHtml(v.test)} <span class="verdict-file">${this.escapeHtml(v.file)}</span></div>
+                <div class="verdict-body">
+                    <div class="ai-empty">RCA analysis unavailable: ${this.escapeHtml(v.error || 'No analysis result was returned.')}</div>
+                </div>
+            </div>`;
+        }
         const sevClass = `sev-${v.verdict.severity.toLowerCase()}`;
         const fixes = v.verdict.fixes.length
             ? v.verdict.fixes.map((f) => `<li>${this.escapeHtml(f)}</li>`).join('')
@@ -1008,6 +1059,7 @@ class CustomTTAReporter implements Reporter {
                 <div class="verdict-badges">
                     <span class="verdict-badge ${sevClass}">Severity: ${this.escapeHtml(v.verdict.severity)}</span>
                     <span class="verdict-badge prio">Priority: ${this.escapeHtml(v.verdict.priority)}</span>
+                    <span class="verdict-badge source">${v.source === 'llm' ? 'LLM analysis' : 'Rule-based fallback'}</span>
                 </div>
                 <div class="verdict-root"><strong>Root cause:</strong> ${this.escapeHtml(v.verdict.rootCause)}</div>
                 <div class="verdict-fixes"><strong>How to fix:</strong><ul>${fixes}</ul></div>
@@ -1024,16 +1076,21 @@ class CustomTTAReporter implements Reporter {
     }
 
     // Render a single AI dataset as a pretty-printed JSON card.
-    private renderAiCard(d: { test: string; json: string }): string {
+    private renderAiCard(d: { test: string; json: string; source?: string }): string {
         let pretty = d.json;
         try {
             pretty = JSON.stringify(JSON.parse(d.json), null, 2);
         } catch {
             /* keep raw if not parseable */
         }
+        const source = d.source === 'ai'
+            ? 'Generated by AI'
+            : d.source === 'faker'
+                ? 'Faker fallback'
+                : 'Generated data';
         return `
         <div class="ai-card">
-            <div class="ai-card-title">🤖 ${this.escapeHtml(d.test)}</div>
+            <div class="ai-card-title">🤖 ${this.escapeHtml(d.test)} <span class="ai-source">${source}</span></div>
             <pre class="ai-json">${this.escapeHtml(pretty)}</pre>
         </div>`;
     }
@@ -1322,6 +1379,7 @@ class CustomTTAReporter implements Reporter {
         .heal-intent { color: #777; font-style: italic; }
         .heal-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 7px 10px; border-radius: 6px; margin-top: 6px; }
         .heal-ok { background: #eefaf0; border-left: 3px solid #2e9e4f; }
+        .heal-suggestion { background: #eff6ff; border-left: 3px solid #3b82f6; }
         .heal-bad { background: #f7f7f7; border-left: 3px solid #bbb; opacity: .75; }
         .heal-sel { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
         .heal-badge { font-size: 11px; padding: 2px 7px; border-radius: 10px; background: #e8e8e8; color: #444; }
@@ -1329,9 +1387,11 @@ class CustomTTAReporter implements Reporter {
         .heal-badge.bad { background: #ddd; color: #555; }
         .heal-why { flex-basis: 100%; font-size: 12.5px; color: #555; }
         .heal-rejected { margin-top: 4px; font-size: 13px; }
+        .heal-screenshot { width: fit-content; color: #2563eb; }
         .heal-note { font-size: 12px; color: #888; border-top: 1px dashed #ddd; padding-top: 8px; }
         .ai-card { border: 1px solid #e2e8f0; border-radius: 10px; overflow: hidden; background: #fff; }
         .ai-card-title { background: #ecfdf5; color: #047857; font-weight: 600; padding: 10px 14px; border-bottom: 1px solid #e2e8f0; }
+        .ai-source { float: right; font-size: 12px; font-weight: 500; color: #475569; }
         .ai-json { margin: 0; padding: 14px; background: #1e293b; color: #e2e8f0; font-family: 'JetBrains Mono', monospace; font-size: 13px; overflow-x: auto; white-space: pre; }
         .verdict-file { float: right; font-weight: 400; font-size: 12px; color: #64748b; font-family: 'JetBrains Mono', monospace; }
         .verdict-body { padding: 14px; }
@@ -1342,6 +1402,7 @@ class CustomTTAReporter implements Reporter {
         .verdict-badge.sev-high { background: #ef4444; }
         .verdict-badge.sev-medium { background: #f59e0b; }
         .verdict-badge.sev-low { background: #22c55e; }
+        .verdict-badge.source { background: #475569; }
         .verdict-root { margin-bottom: 12px; color: #1e293b; }
         .verdict-fixes ul { margin: 6px 0 0 18px; }
         .verdict-fixes li { margin: 4px 0; color: #334155; }
@@ -1357,6 +1418,15 @@ class CustomTTAReporter implements Reporter {
         .flaky-list { display: flex; flex-direction: column; gap: 8px; }
         .flaky-item { background: #fffbeb; border: 1px solid #fcd34d; border-left: 4px solid #f59e0b; border-radius: 8px; padding: 10px 14px; font-weight: 500; color: #92400e; }
         .flaky-summary { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 14px; color: #334155; line-height: 1.5; }
+        .deflaky-card { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 10px; padding: 16px; }
+        .deflaky-card h3 { margin: 0 0 8px; color: #0f172a; }
+        .deflaky-meta { color: #64748b; font-size: 13px; margin-bottom: 14px; }
+        .deflaky-counts { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; margin-bottom: 14px; }
+        .deflaky-table { width: 100%; border-collapse: collapse; background: #fff; }
+        .deflaky-table th, .deflaky-table td { border: 1px solid #e2e8f0; padding: 8px 10px; text-align: left; }
+        .deflaky-table th { background: #f1f5f9; color: #334155; }
+        .deflaky-state { font-weight: 600; }
+        .deflaky-tab-badge { margin-left: 6px; font-size: 11px; font-weight: 600; color: #92400e; }
 
         :root {
             --primary: #059669;

@@ -15,9 +15,9 @@
 import { faker } from '@faker-js/faker';
 import { envOr } from '@config/env';
 import { hasApiKey, normalizeProvider, PROVIDERS } from '../ai/config/providers';
-import { CHECKOUT_CUSTOMER_PROMPT } from '../ai/prompts/checkoutCustomer';
 import { TRANSFER_NOTE_PROMPT } from '../ai/prompts/transferNote';
 import { generateJson } from '../ai/llmGateway';
+import { testDataAgent } from '../ai/agents/testDataAgent';
 
 function shouldFallbackToFaker(): boolean {
     const selectedProvider = process.env.LLM_PROVIDER?.trim();
@@ -41,6 +41,11 @@ export interface CheckoutCustomer {
     firstName: string;
     lastName: string;
     postalCode: string;
+}
+
+export interface CheckoutCustomerGeneration {
+    customer: CheckoutCustomer;
+    source: 'ai' | 'faker';
 }
 
 export interface UserProfile extends Credentials, CheckoutCustomer {
@@ -178,17 +183,19 @@ export class DataGenerator {
 
     /** Generates fictional checkout data through the configured LLM provider. */
     static async checkoutCustomerFromAI(): Promise<CheckoutCustomer> {
+        return (await DataGenerator.checkoutCustomerFromAIWithSource()).customer;
+    }
+
+    /** Generates checkout data and records whether the LLM or Faker supplied it. */
+    static async checkoutCustomerFromAIWithSource(): Promise<CheckoutCustomerGeneration> {
         if (!hasApiKey() && shouldFallbackToFaker()) {
             console.warn(
                 '[DataGenerator] No API key for the selected LLM provider; skipping AI and using Faker checkout data.',
             );
-            return DataGenerator.checkoutCustomer();
+            return { customer: DataGenerator.checkoutCustomer(), source: 'faker' };
         }
 
-        const response = await generateJson<unknown>(CHECKOUT_CUSTOMER_PROMPT);
-        if (!response || typeof response !== 'object' || Array.isArray(response)) {
-            throw new Error('LLM returned invalid checkout customer data.');
-        }
+        const response = await testDataAgent.run(undefined);
 
         const fieldAliases: Record<string, string[]> = {
             firstName: ['firstname'],
@@ -238,9 +245,12 @@ export class DataGenerator {
         }
 
         return {
-            firstName: normalizeName('firstName'),
-            lastName: normalizeName('lastName'),
-            postalCode: postalCode.trim(),
+            source: 'ai',
+            customer: {
+                firstName: normalizeName('firstName'),
+                lastName: normalizeName('lastName'),
+                postalCode: postalCode.trim(),
+            },
         };
     }
 
